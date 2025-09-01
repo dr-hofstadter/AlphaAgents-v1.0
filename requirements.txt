@@ -3,5 +3,5 @@ yfinance
 pandas
 numpy
 google-generativeai
-autogen
 matplotlib
+ag2[gemini]
