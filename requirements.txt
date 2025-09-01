@@ -2,6 +2,5 @@ streamlit
 yfinance
 pandas
 numpy
+google-generativeai
 autogen
-google-generative-ai
-matplotlib
