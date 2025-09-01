@@ -5,46 +5,40 @@ import numpy as np
 from autogen import AssistantAgent, UserProxyAgent
 import google.generativeai as genai
 import time
-import matplotlib.pyplot as plt  # Explicitly import matplotlib
+import matplotlib.pyplot as plt
 
-# Load API keys from secrets
+# Load API keys
 gemini_api_key = st.secrets["gemini"]["api_key"]
 news_api_key = st.secrets["newsapi"]["api_key"]
 
-# Configure Gemini API
+# Configure Gemini
 genai.configure(api_key=gemini_api_key)
 config_list = [{"model": "gemini-1.5-flash", "api_type": "google", "api_key": gemini_api_key}]
 
-# Initialize agents outside the main loop
+# Agents
 valuation_agent = AssistantAgent(
     name="Valuation_Agent",
-    system_message="",  # Gemini prepends instructions
+    system_message="",
     llm_config={"config_list": config_list},
 )
-
 user_proxy = UserProxyAgent(name="User", human_input_mode="NEVER", code_execution_config=False, max_consecutive_auto_reply=1)
 
-# Streamlit UI with session state
+# Streamlit UI
 st.title("AlphaAgents India: Stock Valuation (MVP with Gemini)")
 st.write("Enter an NSE ticker (e.g., RELIANCE.NS) and risk profile. Disclaimer: Educational only, not financial advice.")
 
-# Initialize session state
-if "analyzed" not in st.session_state:
-    st.session_state.analyzed = False
-    st.session_state.result = None
-    st.session_state.last_request_time = 0
-    st.session_state.chat_history = []
-    st.session_state.data_summary = ""
+# Session state
+if "recommendations" not in st.session_state:
+    st.session_state.recommendations = {}  # cache { (ticker, risk): recommendation }
+if "prices" not in st.session_state:
     st.session_state.prices = None
-    st.session_state.last_ticker = None  # Track last used ticker
-    st.session_state.last_risk_profile = None  # Track last used risk profile
 
 with st.sidebar:
     ticker = st.text_input("Stock Ticker (e.g., RELIANCE.NS)", value="RELIANCE.NS")
     risk_profile = st.selectbox("Risk Profile", ["Neutral", "Averse"])
     analyze_button = st.button("Analyze Stock")
 
-# Calculate annualized return and volatility
+# Metrics calculation
 def calculate_metrics(prices):
     daily_returns = prices['Close'].pct_change().dropna()
     cumulative_return = daily_returns.sum()
@@ -52,84 +46,79 @@ def calculate_metrics(prices):
     volatility = daily_returns.std() * np.sqrt(252)
     return annualized_return, volatility
 
-# Function to fetch and update stock data
+# Fetch stock data
 def update_stock_data(ticker):
     stock = yf.Ticker(ticker)
     prices = stock.history(period="4mo")
     if prices.empty:
-        st.error("Invalid ticker or no data available.")
         return None, None
     annualized_return, volatility = calculate_metrics(prices)
-    data_summary = f"Stock: {ticker}\nAnnualized Return: {annualized_return:.2%}\nVolatility: {volatility:.2%}"
-    return prices, data_summary
+    summary = f"Stock: {ticker}\nAnnualized Return: {annualized_return:.2%}\nVolatility: {volatility:.2%}"
+    return prices, summary
 
-# Function to get or update recommendation
-def get_recommendation(data_summary, risk_profile):
-    if (st.session_state.last_ticker == ticker and 
-        st.session_state.last_risk_profile == risk_profile and 
-        st.session_state.chat_history):
-        return st.session_state.chat_history[-1].get('content', 'No recommendation.')
-    with st.spinner("Updating recommendation with Gemini..."):
-        system_instruction = "Analyze stock prices and volumes for valuation. Provide a buy/sell recommendation based on annualized return and volatility. Use data provided. Respond only once unless further prompted."
-        message = f"{system_instruction}\n\nAnalyze {data_summary} with risk-{risk_profile.lower()} profile. Recommend Buy/Sell."
+# Safe Gemini call with retry
+def safe_gemini_call(message, retries=3, delay=5):
+    for attempt in range(retries):
         try:
             result = user_proxy.initiate_chat(valuation_agent, message=message, max_turns=1)
-            st.session_state.result = result
-            st.session_state.chat_history = result.chat_history
-            st.session_state.last_request_time = time.time()
-            st.session_state.last_ticker = ticker
-            st.session_state.last_risk_profile = risk_profile
-            return st.session_state.chat_history[-1].get('content', 'No recommendation.')
+            return result.chat_history[-1].get('content', 'No recommendation.')
         except Exception as e:
-            st.error(f"Error: {e}. Please wait 45 seconds and try again.")
-            return None
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait_time = delay * (2 ** attempt)
+                st.warning(f"Gemini quota hit. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
+    st.error("Gemini quota exceeded. Showing last saved recommendation if available.")
+    return None
 
-# Update data when ticker or analyze button changes
-if analyze_button or (st.session_state.analyzed and st.session_state.last_ticker != ticker):
+# Get recommendation (with cache)
+def get_recommendation(data_summary, ticker, risk_profile):
+    key = (ticker, risk_profile)
+    if key in st.session_state.recommendations:
+        return st.session_state.recommendations[key]
+
+    system_instruction = (
+        "Analyze stock prices and volumes for valuation. "
+        "Provide a buy/sell recommendation based on annualized return and volatility. "
+        "Respond only once unless further prompted."
+    )
+    message = f"{system_instruction}\n\nAnalyze {data_summary} with risk-{risk_profile.lower()} profile. Recommend Buy/Sell."
+
+    with st.spinner("Fetching Gemini recommendation..."):
+        rec = safe_gemini_call(message)
+        if rec:
+            st.session_state.recommendations[key] = rec
+        return rec
+
+# Main analysis
+if analyze_button:
     with st.spinner("Fetching stock data..."):
-        prices, data_summary = update_stock_data(ticker)
-        if prices is not None and data_summary is not None:
+        prices, summary = update_stock_data(ticker)
+        if prices is not None:
             st.session_state.prices = prices
-            st.session_state.data_summary = data_summary
-            recommendation = get_recommendation(data_summary, risk_profile)
+            recommendation = get_recommendation(summary, ticker, risk_profile)
+
+            st.subheader("Valuation Report")
+            st.write(summary)
             if recommendation:
-                st.session_state.analyzed = True
-                st.session_state.last_ticker = ticker
-                st.session_state.last_risk_profile = risk_profile
+                st.write("Recommendation:")
+                st.success(recommendation)
 
-# Display results
-if st.session_state.analyzed:
-    st.subheader("Valuation Report")
-    st.write(st.session_state.data_summary)
-    st.write("Recommendation:")
-    recommendation = get_recommendation(st.session_state.data_summary, risk_profile)
-    if recommendation:
-        st.write(recommendation)
-    
-    st.subheader("Price History")
-    if st.session_state.prices is not None:
-        fig = plt.figure(figsize=(10, 5))
-        plt.plot(st.session_state.prices.index, st.session_state.prices['Close'], label='Close Price')
-        plt.title(f"{ticker} Close Price (4 Months)")
-        plt.xlabel("Date")
-        plt.ylabel("Price (INR)")
-        plt.legend()
-        plt.grid(True)
-        st.pyplot(fig)
-    else:
-        st.error("No price data available to display.")
+            st.subheader("Price History")
+            fig = plt.figure(figsize=(10, 5))
+            plt.plot(prices.index, prices['Close'], label='Close Price')
+            plt.title(f"{ticker} Close Price (4 Months)")
+            plt.xlabel("Date")
+            plt.ylabel("Price (INR)")
+            plt.legend()
+            plt.grid(True)
+            st.pyplot(fig)
+        else:
+            st.error("Invalid ticker or no data available.")
 
-# Reset button to allow re-analysis
-if st.session_state.analyzed:
-    if st.button("Reset Analysis"):
-        st.session_state.analyzed = False
-        st.session_state.result = None
-        st.session_state.chat_history = []
-        st.session_state.data_summary = ""
-        st.session_state.prices = None
-        st.session_state.last_request_time = 0
-        st.session_state.last_ticker = None
-        st.session_state.last_risk_profile = None
-        st.experimental_rerun()
-
-# Run with: streamlit run app.py
+# Reset cache
+if st.button("Reset Analysis"):
+    st.session_state.recommendations.clear()
+    st.session_state.prices = None
+    st.experimental_rerun()
