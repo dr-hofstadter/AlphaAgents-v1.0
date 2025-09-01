@@ -13,7 +13,14 @@ news_api_key = st.secrets["newsapi"]["api_key"]
 
 # Configure Gemini
 genai.configure(api_key=gemini_api_key)
-config_list = [{"model": "gemini-1.5-flash", "api_type": "google", "api_key": gemini_api_key}]
+config_list = [
+    {
+        "model": "gemini-2.5-flash-lite",
+        "api_type": "google",
+        "api_key": gemini_api_key
+    }
+]
+
 
 # Agents
 valuation_agent = AssistantAgent(
@@ -122,3 +129,4 @@ if st.button("Reset Analysis"):
     st.session_state.recommendations.clear()
     st.session_state.prices = None
     st.experimental_rerun()
+
